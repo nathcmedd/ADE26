@@ -1,0 +1,315 @@
+---
+title: "ADE3 Step 3 worksheet: quantifying diversity"
+author: "Your name"
+date: "Thursday 29 October 2026"
+output:
+  html_document:
+    toc: true
+---
+
+## How to use this worksheet
+
+1.  Save a copy with your surname (for example, `ADE3_diversity_Smith.Rmd`) in the same folder as `ADE3_class_data_frozen.csv`.
+2.  Work through the sections in order, alongside the handout. Run a whole chunk by clicking its green arrow, or run a single line with Ctrl+Enter (Cmd+Enter on a Mac). Read the output before moving on.
+3.  Type your answers after each "Answer:" line.
+4.  When you have finished, click Knit to produce a record of your code, output and answers. Keep this file: it is part of your analytical working for the briefing note.
+
+## Set up R
+
+Run this chunk first. If R asks about a personal library, type `yes` both times.
+
+```{r setup-packages}
+# Install each package if it is missing (only happens once per computer), then load it
+if (!require(tidyverse)) install.packages("tidyverse", repos = "https://cloud.r-project.org")
+if (!require(vegan)) install.packages("vegan", repos = "https://cloud.r-project.org")
+
+library(tidyverse)
+library(vegan)
+
+# This should print TRUE. If it prints FALSE, check the CSV is in the same folder as this file.
+file.exists("ADE3_class_data_frozen.csv")
+```
+
+## 3.1 What Shannon and Simpson measure
+
+Calculate $H'$ and $1 - D$ by hand for each community first, then check your answers.
+
+-   Community A: three species with counts 5, 3 and 2.
+-   Community B: four species with counts 7, 1, 1 and 1.
+
+```{r mini-problem}
+diversity(c(5, 3, 2))                         # Shannon H', community A
+diversity(c(7, 1, 1, 1))                      # Shannon H', community B
+diversity(c(5, 3, 2), index = "simpson")      # Gini-Simpson (1 - D), community A
+diversity(c(7, 1, 1, 1), index = "simpson")   # Gini-Simpson (1 - D), community B
+```
+
+Which community has more species? Which is more diverse? Why do these differ?
+
+Answer:
+
+## 3.2 Load and clean the class data
+
+A "New names" message is expected when the file is read, because two columns have no header.
+
+```{r load-data}
+arth <- read_csv("ADE3_class_data_frozen.csv",
+                 col_types = cols(.default = "c"),   # read every column as text
+                 na = c("", "NA", "-", "n/a")) %>%   # treat blanks and placeholders as missing
+  rename(Surname = 1) %>%                            # name the unheaded first column
+  select(-starts_with("...")) %>%                    # drop the empty unnamed column
+  filter(!is.na(Initials))                           # drop blank rows
+
+nrow(arth)    # number of specimen records
+names(arth)   # check the column names
+```
+
+Standardise the names, then apply the corrections table.
+
+```{r clean-data}
+# Standardise capitalisation and remove stray spaces
+arth <- arth %>%
+  mutate(across(matches("^(Class|Order|Family|Genus)_"), ~ str_to_title(str_squish(.x))),
+         Habitat = str_to_title(str_squish(Habitat)))
+
+# Corrections: each entry reads "as typed" = "corrected". Add any new ones you find.
+fixes <- c(
+  # Class
+  "Insects" = "Insecta", "Insect" = "Insecta",
+  "Pancrustacea" = "Insecta",                # Pancrustacea is above class level
+  "Malacosraca" = "Malacostraca",
+  # Order
+  "Harvestmen" = "Opiliones", "Opilones" = "Opiliones", "Opilinoes" = "Opiliones",
+  "Neuropotera" = "Neuroptera", "Diptera (True Flies)" = "Diptera",
+  # Family
+  "Phalangiid" = "Phalangiidae", "Phalangiid Harvestman" = "Phalangiidae",
+  "Syphridae" = "Syrphidae", "Scathophlagidae" = "Scathophagidae",
+  "Aculeta" = "Vespidae",                    # Aculeata is an infraorder, typed in the Family column
+  "Sclerosomatidae/Phalangiidae" = "Sclerosomatidae",   # Leiobunum is a sclerosomatid
+  # Genus
+  "Procellio" = "Porcellio", "Episyrphyus" = "Episyrphus",
+  # Habitat
+  "Outside Ashworth" = "Ashworth Trees",     # same coordinates as an Ashworth Trees record
+  "Ashworth Medows" = "Ashworth Meadows",
+  "Nucleus" = "Nucleus Mound", "Nucleus Mounds" = "Nucleus Mound",
+  "Murchison House" = "Murchison"
+)
+
+# Replace any name found in the corrections table; keep all other names as they are
+arth <- arth %>%
+  mutate(across(c(matches("^(Class|Order|Family|Genus)_"), Habitat),
+                ~ coalesce(unname(fixes[.x]), .x)))
+```
+
+Check what is left. Look for typos, near-duplicates and names at the wrong rank.
+
+```{r check-data}
+count(arth, Habitat, sort = TRUE)
+count(arth, Family_Morphology, sort = TRUE)
+count(arth, Family_AI, sort = TRUE)
+count(arth, Family_DNA, sort = TRUE)
+```
+
+Did you find any names that still need correcting? If so, add them to `fixes` and rerun the clean-data chunk.
+
+Answer:
+
+Look at the `Lat_long` values for Ashworth Meadows, Behind Ashworth and Nucleus Mound. Are these really separate places? What does that mean for comparing them?
+
+Answer:
+
+## 3.3 Choose your taxonomic level and identification source
+
+```{r best-id}
+# Best available ID at each rank: DNA first, then morphology, then AI
+arth <- arth %>%
+  mutate(Class_Best  = coalesce(Class_DNA,  Class_Morphology,  Class_AI),
+         Order_Best  = coalesce(Order_DNA,  Order_Morphology,  Order_AI),
+         Family_Best = coalesce(Family_DNA, Family_Morphology, Family_AI),
+         Genus_Best  = coalesce(Genus_DNA,  Genus_Morphology,  Genus_AI))
+```
+
+Set the two choices that the rest of the analysis depends on.
+
+```{r choose-level}
+level     <- "Family"   # "Class", "Order", "Family" or "Genus"
+id_source <- "Best"     # "Best", "DNA", "Morphology" or "AI"
+
+arth_lvl <- arth %>%
+  mutate(taxon = .data[[paste(level, id_source, sep = "_")]]) %>%
+  filter(!is.na(taxon), !is.na(Habitat))
+
+nrow(arth)       # all specimen records
+nrow(arth_lvl)   # records identified at your chosen level
+```
+
+How many specimens did you lose by choosing this level?
+
+Answer:
+
+Compare the identification sources at your chosen level.
+
+```{r compare-sources}
+sources <- c("AI", "Morphology", "DNA", "Best")
+
+data.frame(
+  source     = sources,
+  identified = sapply(sources, function(s) sum(!is.na(arth[[paste(level, s, sep = "_")]]))),
+  taxa       = sapply(sources, function(s) n_distinct(arth[[paste(level, s, sep = "_")]], na.rm = TRUE))
+)
+```
+
+Which method identified the most specimens at this level?
+
+Answer:
+
+Why can you not compare the numbers in the `taxa` column directly between methods?
+
+Answer:
+
+## 3.4 Diversity by habitat
+
+```{r diversity-by-habitat}
+# Community matrix: one row per habitat, one column per taxon, cells are counts
+comm <- arth_lvl %>%
+  count(Habitat, taxon) %>%
+  pivot_wider(names_from = taxon, values_from = n, values_fill = 0) %>%
+  column_to_rownames("Habitat")
+
+N <- rowSums(comm)                       # specimens per habitat
+S <- specnumber(comm)                    # richness
+H <- diversity(comm, index = "shannon")  # Shannon's H'
+J <- H / log(S)                          # Pielou's evenness (NaN if S = 1)
+G <- diversity(comm, index = "simpson")  # Gini-Simpson, 1 - D
+
+div_table <- data.frame(N, S, H = round(H, 2), J = round(J, 2), Simpson = round(G, 2))
+div_table
+```
+
+Which habitat has the highest richness? Which has the highest $H'$? If the answers differ, use $J'$ to explain why.
+
+Answer:
+
+Note two records, habitats or taxa that you might discuss in your briefing note.
+
+Answer:
+
+Quick check: several Secret Garden specimens are shield bugs collected from the same bushes, and each student chose one specimen to collect. What does the shield bug count actually measure? What does that mean for interpreting $H'$ and Simpson here?
+
+Answer:
+
+## 3.5 Sampling effort and rarefaction
+
+```{r rarefaction}
+N   # check specimens per habitat first
+
+# Habitats with very few specimens drag every habitat down to a tiny sample size.
+# If needed, drop them before rarefying by removing the # from the next two lines:
+# comm <- comm[N >= 5, ]
+# N <- rowSums(comm)
+
+rarefy(comm, sample = min(N))            # expected taxa at equal sample size
+rarecurve(comm, step = 1, label = TRUE)  # rarefaction curve for each habitat
+```
+
+Does the ranking of habitats change after rarefaction? If so, what does that tell you about the raw comparison in section 3.4?
+
+Answer:
+
+Quick check: Ashworth Trees yielded far more specimens and more families than Ashworth Meadows. What would you check before agreeing that the trees support greater arthropod diversity?
+
+Answer:
+
+## 3.6 Collector's curve
+
+```{r specimen-matrix}
+# Matrix with one row per specimen
+spec_mat <- arth_lvl %>%
+  mutate(specimen = row_number(), present = 1) %>%
+  select(specimen, taxon, present) %>%
+  pivot_wider(names_from = taxon, values_from = present, values_fill = 0) %>%
+  select(-specimen)
+```
+
+```{r collectors-curve}
+# Two curves: the order in the sheet, and the average of 100 random orders
+set.seed(1)
+curve_order  <- specaccum(spec_mat, method = "collector")
+curve_random <- specaccum(spec_mat, method = "random", permutations = 100)
+
+# Extract the numbers from each curve into a data frame for ggplot
+random_df <- tibble(specimens = curve_random$sites,
+                    taxa      = curve_random$richness,
+                    sd        = curve_random$sd)
+
+order_df  <- tibble(specimens = curve_order$sites,
+                    taxa      = curve_order$richness)
+
+# Build the plot and store it, so it can be saved in section 3.7
+curve_plot <- ggplot() +
+  geom_ribbon(data = random_df,
+              aes(x = specimens, ymin = taxa - 2 * sd, ymax = taxa + 2 * sd),
+              fill = "lightblue") +
+  geom_line(data = random_df,
+            aes(x = specimens, y = taxa, colour = "random"),
+            linewidth = 1) +
+  geom_line(data = order_df,
+            aes(x = specimens, y = taxa, colour = "sheet"),
+            linewidth = 1) +
+  scale_colour_manual(values = c(random = "blue", sheet = "red"),
+                      labels = c(random = "Random order (mean \u00B1 2 SD)",   # \u00B1 is the ± sign
+                                 sheet  = "Sheet order")) +
+  labs(x = "Specimens identified",
+       y = paste0("Cumulative number of taxa (", level, ")"),
+       colour = NULL) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+curve_plot
+
+# Estimate total richness from rare taxa (singletons and doubletons)
+estimateR(colSums(spec_mat))
+```
+
+Does the red curve differ from the blue curve? Why does randomising the order give a fairer curve?
+
+Answer:
+
+Has the blue curve levelled off?
+
+Answer:
+
+Compare S.obs with S.chao1. Roughly what proportion of taxa have we detected?
+
+Answer:
+
+If we identified another 50 specimens, would you expect new taxa? Use the slope at the right-hand end of the curve to justify your answer.
+
+Answer:
+
+Quick check: a curve at Order level has completely levelled off. Does this mean we have sampled all the arthropod species on campus?
+
+Answer:
+
+## 3.7.1 Save your outputs
+
+The file names record your chosen level and source, so outputs from different runs do not overwrite each other.
+
+```{r save-outputs}
+# Diversity table
+write_csv(rownames_to_column(div_table, "Habitat"),
+          paste0("diversity_table_", level, "_", id_source, ".csv"))
+
+# Collector's curve
+ggsave(paste0("collectors_curve_", level, "_", id_source, ".png"),
+       plot = curve_plot, width = 8, height = 6, dpi = 200)
+
+# Rarefaction curves (still drawn with base graphics)
+png(paste0("rarefaction_", level, "_", id_source, ".png"),
+    width = 1600, height = 1200, res = 200)
+rarecurve(comm, step = 1, label = TRUE)
+dev.off()
+```
+
+
+Finally, save this file (Ctrl+S) and click Knit to produce a record of your working. Rerun the worksheet on the final cleaned dataset before writing your briefing note.
